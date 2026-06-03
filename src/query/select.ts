@@ -1,8 +1,10 @@
 import { type RecordId, Table } from "surrealdb";
 import type { Orm } from "../schema/orm.ts";
+import type { RowTraversal } from "../schema/traversal.ts";
 import {
 	type AbstractType,
 	ArrayType,
+	type GraphType,
 	ObjectType,
 	type ObjectTypeInner,
 	OptionType,
@@ -16,6 +18,7 @@ import {
 	type InheritableIntoType,
 	inheritableIntoWorkable,
 } from "../utils/inheritable.ts";
+import { traversableRow } from "../utils/traversal.ts";
 import {
 	__ctx,
 	__display,
@@ -141,9 +144,12 @@ export class SelectQuery<
 	private _fetchResolvedType?: AbstractType;
 	private _timeout?: string;
 	private tb: T;
-	private subject: T | RecordId<T> | Workable<C, RecordType<T>>;
+	private subject: T | RecordId<T> | Workable<C, RecordType<T> | GraphType<T>>;
 
-	constructor(orm: O, subject: T | RecordId<T> | Workable<C, RecordType<T>>) {
+	constructor(
+		orm: O,
+		subject: T | RecordId<T> | Workable<C, RecordType<T> | GraphType<T>>,
+	) {
 		super();
 		this[__ctx] = {
 			orm,
@@ -177,17 +183,30 @@ export class SelectQuery<
 		return t.array(this.entry);
 	}
 
-	return<
-		P extends Inheritable<C>,
-		R extends InheritableIntoType<C, P> = InheritableIntoType<C, P>,
-	>(cb: (tb: Actionable<C, E>) => P): SelectQuery<O, C, T, R> {
-		const tb = actionable({
+	/**
+	 * Build the row actionable handed to `.return()` / `.where()` / `.orderBy()`
+	 * callbacks: it renders as `$this` (or `$parent` when nested) and carries the
+	 * row's id, so traversal verbs called directly on it root at `<row>.id`.
+	 */
+	private rowActionable<S extends AbstractType>(type: S): Actionable<C, S> {
+		const base = actionable({
 			[__ctx]: this[__ctx],
-			[__type]: this.entry,
+			[__type]: type,
 			[__display]: ({ contextId }) => {
 				return contextId === this[__ctx].id ? "$this" : "$parent";
 			},
-		}) as Actionable<C, E>;
+		}) as Actionable<C, S>;
+		return traversableRow(base, this[__ctx].orm.tables[this.tb]!.schema.schema);
+	}
+
+	return<
+		P extends Inheritable<C>,
+		R extends InheritableIntoType<C, P> = InheritableIntoType<C, P>,
+	>(
+		cb: (tb: Actionable<C, E> & RowTraversal<C, T>) => P,
+	): SelectQuery<O, C, T, R> {
+		const tb = this.rowActionable(this.entry) as Actionable<C, E> &
+			RowTraversal<C, T>;
 
 		const predicable = cb(tb);
 		const workable = inheritableIntoWorkable<C, P>(
@@ -200,14 +219,14 @@ export class SelectQuery<
 		}) as unknown as SelectQuery<O, C, T, R>;
 	}
 
-	where(cb: (tb: Actionable<C, O["tables"][T]["schema"]>) => Workable<C>) {
-		const tb = actionable({
-			[__ctx]: this[__ctx],
-			[__type]: this[__ctx].orm.tables[this.tb]!.schema,
-			[__display]: ({ contextId }) => {
-				return contextId === this[__ctx].id ? "$this" : "$parent";
-			},
-		}) as Actionable<C, O["tables"][T]["schema"]>;
+	where(
+		cb: (
+			tb: Actionable<C, O["tables"][T]["schema"]> & RowTraversal<C, T>,
+		) => Workable<C>,
+	) {
+		const tb = this.rowActionable(
+			this[__ctx].orm.tables[this.tb]!.schema,
+		) as Actionable<C, O["tables"][T]["schema"]> & RowTraversal<C, T>;
 
 		const filter = sanitizeWorkable(cb(tb));
 		return this.derive((next) => {
@@ -228,7 +247,9 @@ export class SelectQuery<
 	}
 
 	private _addOrderBy(
-		field: FieldKeys<O, T> | ((record: Actionable<C, E>) => Workable<C>),
+		field:
+			| FieldKeys<O, T>
+			| ((record: Actionable<C, E> & RowTraversal<C, T>) => Workable<C>),
 		direction?: "ASC" | "DESC",
 		opts?: { collate?: boolean; numeric?: boolean },
 	): this {
@@ -238,13 +259,8 @@ export class SelectQuery<
 				: {
 						field: sanitizeWorkable(
 							field(
-								actionable({
-									[__ctx]: this[__ctx],
-									[__type]: this.entry,
-									[__display]: ({ contextId }) => {
-										return contextId === this[__ctx].id ? "$this" : "$parent";
-									},
-								}) as Actionable<C, E>,
+								this.rowActionable(this.entry) as Actionable<C, E> &
+									RowTraversal<C, T>,
 							),
 						),
 						direction,
@@ -256,21 +272,27 @@ export class SelectQuery<
 	}
 
 	orderBy(
-		field: FieldKeys<O, T> | ((record: Actionable<C, E>) => Workable<C>),
+		field:
+			| FieldKeys<O, T>
+			| ((record: Actionable<C, E> & RowTraversal<C, T>) => Workable<C>),
 		direction?: "ASC" | "DESC",
 	): this {
 		return this._addOrderBy(field, direction);
 	}
 
 	orderByNumeric(
-		field: FieldKeys<O, T> | ((record: Actionable<C, E>) => Workable<C>),
+		field:
+			| FieldKeys<O, T>
+			| ((record: Actionable<C, E> & RowTraversal<C, T>) => Workable<C>),
 		direction?: "ASC" | "DESC",
 	): this {
 		return this._addOrderBy(field, direction, { numeric: true });
 	}
 
 	orderByCollate(
-		field: FieldKeys<O, T> | ((record: Actionable<C, E>) => Workable<C>),
+		field:
+			| FieldKeys<O, T>
+			| ((record: Actionable<C, E> & RowTraversal<C, T>) => Workable<C>),
 		direction?: "ASC" | "DESC",
 	): this {
 		return this._addOrderBy(field, direction, { collate: true });

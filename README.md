@@ -1204,23 +1204,171 @@ console.log(sql);           // Generated SurrealQL
 console.log(ctx.variables); // Parameterized values
 ```
 
-## Graph relationships
+## Graph traversal
 
-Surqlize provides type-safe graph traversal through the `lookup` system:
+Traverse graph edges directly inside queries. Call `.out()` on a select row to
+follow an edge to the far table (`->edge->target`), or `.in()` to follow it in
+reverse (`<-edge<-source`). TypeScript only permits edges that actually connect
+to the current table, and the result type is inferred automatically.
+
+You can traverse from the row itself (`user.out("authored")`, rooted at the
+row's `id`) or from any record-link field (`post.author.out(...)`).
 
 ```typescript
 const user = table("user", { name: t.string() });
 const post = table("post", { title: t.string() });
-const authored = edge("user", "authored", "post", {});
+const tag = table("tag", { label: t.string() });
+const authored = edge("user", "authored", "post", {
+  created: t.date(),
+  role: t.string(),
+});
+const tagged = edge("post", "tagged", "tag", {});
 
-const db = orm(new Surreal(), user, post, authored);
+const db = orm(new Surreal(), user, post, tag, authored, tagged);
+```
 
-// TypeScript knows which edges connect to which tables
-db.lookup.to;   // { user: ["authored"], authored: ["post"], post: [] }
-db.lookup.from; // { user: [], authored: ["user"], post: ["authored"] }
+### Materialising records with `.select()`
 
-// Use in queries for type-safe graph navigation
-// (This feature is under active development)
+Chain `.select().return()` to project the records a traversal lands on. The
+traversal compiles to a subquery:
+
+```typescript
+const usersWithPosts = db.select("user").return((user) => ({
+  name: user.name,
+  posts: user
+    .out("authored")              // ->authored->post
+    .select()
+    .return((post) => ({ title: post.title })),
+}));
+// posts is typed as { title: string }[]
+```
+
+### Bare traversals return record links
+
+Used directly in a projection, a traversal yields an array of record links —
+exactly like raw SurrealQL `->authored->post`:
+
+```typescript
+const query = db.select("user").return((user) => ({
+  postIds: user.out("authored"),
+}));
+
+type Result = t.infer<typeof query>;
+// Result: Array<{ postIds: RecordId<"post">[] }>
+```
+
+### Multi-hop chaining
+
+Steps chain, with every hop re-typed against the table it lands on:
+
+```typescript
+db.select("user").return((user) => ({
+  tags: user
+    .out("authored")   // -> post
+    .out("tagged")     // -> tag
+    .select()
+    .return((tag) => ({ label: tag.label })),
+}));
+// ->authored->post->tagged->tag
+```
+
+### Incoming edges
+
+```typescript
+// Who authored this post?
+db.select("post").return((post) => ({
+  authors: post
+    .in("authored")               // <-authored<-user
+    .select()
+    .return((user) => ({ name: user.name })),
+}));
+```
+
+### Reading edge fields
+
+`.outEdge()` / `.inEdge()` stop on the edge itself, so you can read its own
+fields (such as `created` or `role`):
+
+```typescript
+db.select("user").return((user) => ({
+  authorships: user.outEdge("authored").select().return((e) => ({
+    when: e.created,
+    role: e.role,
+  })),
+}));
+// ->authored
+```
+
+### Filtering traversals
+
+Filter on the edge mid-traversal with `where` — this compiles to
+`->(edge WHERE …)->target`, and the callback receives the edge's fields:
+
+```typescript
+db.select("user").return((user) => ({
+  posts: user
+    .out("authored", { where: (e) => e.role.eq("author") })
+    .select()
+    .return((post) => ({ title: post.title })),
+}));
+// ->(authored WHERE role = "author")->post
+```
+
+Traversals also compose inside `WHERE` to filter the outer query. `len()` and
+`isEmpty()` are the idiomatic "has any" / "has none" checks:
+
+```typescript
+// Users who have authored at least one post
+db.select("user").where((user) => user.out("authored").len().gt(0));
+
+// Users who have authored none
+db.select("user").where((user) => user.out("authored").isEmpty());
+```
+
+### Recursive traversal & path finding
+
+Repeat a hop with `depth` to walk several levels deep — this compiles to
+SurrealDB's recursive idiom `record.{depth}(->edge->target)` and returns the
+records reached at the deepest level. `depth` is an exact number, an inclusive
+`[min, max]` range, or `{ min?, max? }` for open-ended ranges:
+
+```typescript
+const person = table("person", { name: t.string() });
+const knows = edge("person", "knows", "person", {});
+const db = orm(new Surreal(), person, knows);
+
+// Connections between one and three hops away
+db.select("person").return((p) => ({
+  network: p.out("knows", { depth: [1, 3] }),
+}));
+// person.{1..3}(->knows->person)
+```
+
+Add `collect` to gather every unique node encountered, or `shortest` to find the
+shortest path to a target record:
+
+```typescript
+// Everyone reachable through `knows`
+db.select("person").return((p) => ({
+  reachable: p.out("knows", { collect: true }), // .{..+collect}(->knows->person)
+}));
+
+// Shortest path from one person to another (the target binds as a parameter)
+db.select("person", "alice").return((p) => ({
+  path: p.out("knows", { shortest: new RecordId("person", "dave") }),
+}));
+// person:alice.{..+shortest=$target}(->knows->person)
+```
+
+`depth` / `collect` / `shortest` compose with edge filtering (`where`) too.
+
+### Edge adjacency metadata
+
+The `lookup` maps expose which edges connect which tables at runtime:
+
+```typescript
+db.lookup.to;   // { user: ["authored"], post: ["tagged"], tag: [], ... }
+db.lookup.from; // { post: ["authored"], tag: ["tagged"], user: [], ... }
 ```
 
 ## Complex example
@@ -1383,7 +1531,8 @@ This project is in active development. Planned features include:
 - [x] **Multi-session support** - Multiple sessions over a single connection
 - [x] **Live queries** - Real-time `LIVE SELECT` subscriptions with typed notifications
 - [ ] **Runtime validation** - Validate data at runtime using schema definitions
-- [ ] **Advanced graph traversal** - Path finding, recursive queries, graph algorithms
+- [x] **Graph traversal** - Type-safe `.out()` / `.in()` edge navigation, multi-hop chaining, edge-field access, and edge filtering
+- [x] **Advanced graph traversal** - Recursive depth ranges, node collection (`collect`), and shortest-path finding (`shortest`)
 - [ ] **Performance optimizations** - Query caching, connection pooling
 - [ ] **Schema migrations** - Version control for database schemas
 - [ ] **Documentation site** - Comprehensive guides and API reference
