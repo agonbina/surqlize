@@ -1,3 +1,4 @@
+import { BoundQuery } from "surrealdb";
 import type { AbstractType } from "../types";
 import {
 	__ctx,
@@ -8,6 +9,7 @@ import {
 	type Workable,
 	type WorkableContext,
 } from "../utils";
+import { type Actionable, actionable } from "../utils/actionable";
 
 /**
  * Abstract base class for all query types. Implements `Workable` so queries can
@@ -145,6 +147,17 @@ export abstract class Query<
 		return Object.assign(fn, { val, at }) as Then<this> & ThenAccessors<this>;
 	}
 
+	wrap(): Actionable<C, T> {
+		const query = this;
+		return actionable({
+			[__ctx]: this[__ctx],
+			[__type]: this[__type],
+			[__display](ctx) {
+				return `(${query[__display](ctx)})`;
+			},
+		});
+	}
+
 	/** Execute the query against SurrealDB and return the parsed result. */
 	async execute() {
 		const ctx = displayContext();
@@ -155,9 +168,38 @@ export abstract class Query<
 		);
 		return this.parseResult(result);
 	}
+
+	/**
+	 * Compile this query into a fully-typed SurrealDB {@link BoundQuery} — the
+	 * query string plus its bindings — that can be handed straight to the SDK's
+	 * `surreal.query(...)`, including inside a manual transaction
+	 * (`await db.begin()`):
+	 *
+	 * ```ts
+	 * const prepared = orm
+	 *   .select("user")
+	 *   .return((user) => ({ fullName: user.name, email: user.email }))
+	 *   .prepare();
+	 *
+	 * const [users] = await db.query(prepared); // users is fully typed
+	 * ```
+	 *
+	 * The result type is preserved (`BoundQuery<[this["type"]]>`), so the SDK
+	 * types the response from the ORM's inferred schema. Unlike {@link execute},
+	 * the SDK's raw result is **not** run through this query's {@link parseResult}
+	 * — the caller owns decoding.
+	 */
+	prepare(): BoundQuery<[this["type"]]> {
+		const ctx = displayContext();
+		const query = this[__display](ctx);
+		return new BoundQuery<[this["type"]]>(query, ctx.variables);
+	}
 }
 
-type Then<Q extends Query> = <TResult1 = Q["type"], TResult2 = never>(
+type Then<Q extends { type: unknown }> = <
+	TResult1 = Q["type"],
+	TResult2 = never,
+>(
 	onFulfilled?:
 		| ((value: Q["type"]) => TResult1 | PromiseLike<TResult1>)
 		| undefined
@@ -175,7 +217,7 @@ type ResultElement<T> = T extends readonly (infer E)[] ? E : T;
  * Convenience accessors hung off {@link Query.then} for reaching into a query's
  * result array without first awaiting it into a variable.
  */
-type ThenAccessors<Q extends Query> = {
+type ThenAccessors<Q extends { type: unknown }> = {
 	/** Execute the query and resolve to the first result, or `undefined`. */
 	val(): Promise<ResultElement<Q["type"]> | undefined>;
 	/**

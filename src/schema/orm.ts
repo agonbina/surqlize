@@ -1,5 +1,5 @@
 import type { SurrealSession } from "surrealdb";
-import { RecordId, type RecordIdValue } from "surrealdb";
+import { RecordId, type RecordIdValue, Uuid } from "surrealdb";
 import { OrmError } from "../error";
 import type { Query } from "../query/abstract";
 import { ApiClient } from "../query/api";
@@ -13,8 +13,30 @@ import { SelectQuery } from "../query/select";
 import type { Transaction } from "../query/transaction";
 import { UpdateQuery } from "../query/update";
 import { UpsertQuery } from "../query/upsert";
-import type { AbstractType, ArrayType, GraphType, RecordType } from "../types";
-import { isWorkable, type Workable, type WorkableContext } from "../utils";
+import {
+	type AbstractType,
+	type ArrayType,
+	type BoolType,
+	type DateType,
+	type GraphType,
+	type NeverType,
+	type NoneType,
+	type NullType,
+	type NumberType,
+	type ObjectType,
+	type RecordType,
+	type StringType,
+	t,
+	type UuidType,
+} from "../types";
+import {
+	__type,
+	intoWorkable,
+	isWorkable,
+	type Workable,
+	type WorkableContext,
+} from "../utils";
+import { type Actionable, actionable } from "../utils/actionable";
 import type { ApiEndpointSchema } from "./api";
 import { EdgeSchema } from "./edge";
 import type { FunctionCallable, InferParams } from "./function";
@@ -64,6 +86,81 @@ type UnionToTuple<U> = [U] extends [never]
 export type SchemaMapTables<S extends SchemaMap> =
 	UnionToTuple<S[keyof S]> extends infer R extends AnyTable[] ? R : never;
 
+type ValueTupleTypes<V extends readonly unknown[]> = {
+	-readonly [K in keyof V]: ValueType<V[K]>;
+};
+
+type ValueArrayType<V extends readonly unknown[]> = V extends readonly []
+	? ArrayType<NeverType>
+	: number extends V["length"]
+		? ArrayType<ValueType<V[number]>>
+		: ValueTupleTypes<V> extends infer T extends AbstractType[]
+			? ArrayType<T>
+			: never;
+
+type ValueObjectFields<V extends Record<string, unknown>> = {
+	[K in keyof V & string]: ValueType<V[K]>;
+};
+
+export type ValueType<V> =
+	V extends Workable<WorkableContext, infer T>
+		? T
+		: V extends RecordId<infer Tb>
+			? RecordType<Tb>
+			: V extends string
+				? StringType
+				: V extends number
+					? NumberType
+					: V extends boolean
+						? BoolType
+						: V extends Date
+							? DateType
+							: V extends Uuid
+								? UuidType
+								: V extends null
+									? NullType
+									: V extends undefined
+										? NoneType
+										: V extends readonly unknown[]
+											? ValueArrayType<V>
+											: V extends Record<string, unknown>
+												? ObjectType<ValueObjectFields<V>>
+												: AbstractType;
+
+function typeFromValue(value: unknown): AbstractType {
+	if (isWorkable(value)) return value[__type];
+	if (value instanceof RecordId) return t.record(String(value.table));
+	if (value instanceof Date) return t.date();
+	if (value instanceof Uuid) return t.uuid();
+	if (value === null) return t.null();
+	if (value === undefined) return t.none();
+
+	switch (typeof value) {
+		case "string":
+			return t.string();
+		case "number":
+			return t.number();
+		case "boolean":
+			return t.bool();
+		case "object": {
+			if (Array.isArray(value)) {
+				if (value.length === 0) return t.array(t.never());
+				return t.array(value.map(typeFromValue) as AbstractType[]);
+			}
+
+			const fields = Object.fromEntries(
+				Object.entries(value).map(([key, field]) => [
+					key,
+					typeFromValue(field),
+				]),
+			) as Record<string, AbstractType>;
+			return t.object(fields);
+		}
+		default:
+			throw new OrmError(`Cannot infer a SurrealDB type for ${typeof value}`);
+	}
+}
+
 /**
  * The main ORM entry point. Provides type-safe query builders for all
  * registered tables and edges.
@@ -79,6 +176,25 @@ export class Orm<T extends AnyTable[] = AnyTable[]> {
 	) {}
 
 	/**
+	 * Wrap a raw JavaScript value as an actionable SurrealQL expression. Record
+	 * ids keep their table type, so graph traversal can start directly from a
+	 * value: `db.value(new RecordId("person", "tobie")).out("authored")`.
+	 */
+	value<const V>(value: V): Actionable<WorkableContext<this>, ValueType<V>> {
+		const ctx = {
+			orm: this,
+			id: Symbol(),
+		} as WorkableContext<this>;
+		return actionable(
+			intoWorkable(
+				ctx,
+				typeFromValue(value) as ValueType<V>,
+				value as ValueType<V>["infer"],
+			),
+		);
+	}
+
+	/**
 	 * Build a SELECT query for a table, record ID, or workable record reference.
 	 *
 	 * @param tb - A table name, `RecordId`, workable record, or table name with a second `id` argument.
@@ -88,6 +204,13 @@ export class Orm<T extends AnyTable[] = AnyTable[]> {
 		C extends WorkableContext<this>,
 		Tb extends keyof this["tables"] & string,
 	>(tb: Tb): SelectQuery<this, C, Tb>;
+
+	// Multiple tables — a heterogeneous select whose rows are the merged schema
+	// of every named table (`SELECT … FROM user, company`).
+	select<
+		C extends WorkableContext<this>,
+		const Tb extends keyof this["tables"] & string,
+	>(tbs: readonly Tb[]): SelectQuery<this, C, Tb>;
 
 	// RecordId
 	select<
@@ -113,10 +236,15 @@ export class Orm<T extends AnyTable[] = AnyTable[]> {
 		C extends WorkableContext<this>,
 		Tb extends keyof this["tables"] & string,
 	>(
-		tb: Tb | RecordId<Tb> | Workable<C, RecordType<Tb> | GraphType<Tb>>,
+		tb:
+			| Tb
+			| readonly Tb[]
+			| RecordId<Tb>
+			| Workable<C, RecordType<Tb> | GraphType<Tb>>,
 		id?: RecordIdValue,
 	) {
 		if (tb instanceof RecordId) return new SelectQuery(this, tb);
+		if (Array.isArray(tb)) return new SelectQuery(this, tb as readonly Tb[]);
 		if (isWorkable(tb))
 			return new SelectQuery(this, tb as Workable<C, RecordType<Tb>>);
 		if (id === undefined) return new SelectQuery(this, tb as Tb);
